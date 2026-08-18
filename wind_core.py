@@ -12,6 +12,8 @@ import csv
 import math
 import time
 from datetime import datetime, timezone
+from functools import lru_cache
+from collections import OrderedDict
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -20,15 +22,43 @@ try:
 except ImportError:
     from requests.packages.urllib3.util.retry import Retry
 
-# --- Session dengan retry otomatis (cegah ConnectionResetError) ---
+# --- Rate Limiting ---
+class RateLimiter:
+    """Membatasi jumlah request per menit ke API eksternal."""
+    def __init__(self, max_requests_per_minute=8):
+        self.max_requests = max_requests_per_minute
+        self.requests = []  # list of timestamps
+    
+    def wait_if_needed(self):
+        """Menunda jika sudah melebihi batas request per menit."""
+        now = time.time()
+        # Hapus request yang lebih dari 60 detik lalu
+        self.requests = [t for t in self.requests if now - t < 60]
+        
+        if len(self.requests) >= self.max_requests:
+            # Hitung berapa detik harus menunggu
+            oldest = self.requests[0]
+            wait_time = 60 - (now - oldest) + 0.5  # sedikit buffer
+            if wait_time > 0:
+                time.sleep(wait_time)
+        
+        self.requests.append(time.time())
+
+_rate_limiter = RateLimiter(max_requests_per_minute=8)
+
+# --- Session dengan retry otomatis ---
 _SESSION = requests.Session()
-_retry = Retry(total=4, backoff_factor=0.6,
-               status_forcelist=[429, 500, 502, 503, 504],
-               allowed_methods=["GET"])
+_retry = Retry(
+    total=8,  # ↑ dari 4 menjadi 8
+    backoff_factor=1.5,  # ↑ exponential backoff lebih agresif
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"],
+    respect_retry_after_header=True  # hormonal Retry-After header dari server
+)
 _adapter = HTTPAdapter(max_retries=_retry)
 _SESSION.mount("https://", _adapter)
 _SESSION.mount("http://", _adapter)
-_SESSION.headers.update({"User-Agent": "wind-enroute-tool/2.0"})
+_SESSION.headers.update({"User-Agent": "wind-enroute-tool/2.1"})
 
 # --- Level altitude yang tersedia ---
 FL_TO_HPA = {
@@ -38,7 +68,27 @@ FL_TO_HPA = {
 ALL_HPA = [850, 700, 600, 500, 400, 300, 250, 200, 150]
 COMPARE_FLS = [240, 300, 340, 390]
 
-_CACHE = {}
+# --- Cache dengan batas ukuran ---
+# Menggunakan dict biasa dengan manajemen manual untuk menghindari memory leak
+_cache = OrderedDict()
+_CACHE_MAX_SIZE = 100  # maksimal 100 lokasi di cache
+
+
+def _cache_get(key):
+    if key in _cache:
+        # Pindahkan ke akhir (recently used)
+        _cache.move_to_end(key)
+        return _cache[key]
+    return None
+
+
+def _cache_set(key, value):
+    if key in _cache:
+        _cache.move_to_end(key)
+    else:
+        if len(_cache) >= _CACHE_MAX_SIZE:
+            _cache.popitem(last=False)  # hapus yang paling lama
+        _cache[key] = value
 
 
 def nearest_fl_key(fl):
@@ -113,45 +163,97 @@ def load_route_from_text(text):
 
 
 # ---------- Ambil data GFS ----------
-def _fetch_all_levels(lat, lon):
-    key = (round(lat, 3), round(lon, 3))
-    if key in _CACHE:
-        return _CACHE[key]
-    url = "https://api.open-meteo.com/v1/gfs"
+def _build_hourly_params():
+    """
+    Bangun list variabel hourly.
+    HANYA wind speed dan direction untuk mengurangi ukuran request.
+    (Yang lama juga fetch temperature dan geopotential_height — tidak perlu untuk analisa wind utama)
+    """
     hourly = []
     for hpa in ALL_HPA:
-        hourly += [f"wind_speed_{hpa}hPa", f"wind_direction_{hpa}hPa",
-                   f"temperature_{hpa}hPa", f"geopotential_height_{hpa}hPa"]
-    params = {"latitude": lat, "longitude": lon, "hourly": hourly,
-              "wind_speed_unit": "kn", "forecast_days": 3, "timezone": "UTC"}
+        hourly.append(f"wind_speed_{hpa}hPa")
+        hourly.append(f"wind_direction_{hpa}hPa")
+    return hourly
+
+
+def _fetch_all_levels(lat, lon):
+    """Fetch data GFS untuk satu lokasi. Dengan rate limiting dan cache."""
+    key = (round(lat, 3), round(lon, 3))
+    
+    # Cek cache dulu
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    
+    # Rate limiting
+    _rate_limiter.wait_if_needed()
+    
+    url = "https://api.open-meteo.com/v1/gfs"
+    hourly = _build_hourly_params()
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": hourly,
+        "wind_speed_unit": "kn",
+        "forecast_days": 3,
+        "timezone": "UTC"
+    }
+    
     last_err = None
-    for attempt in range(4):
+    for attempt in range(8):  # ↑ dari 4 menjadi 8
         try:
-            r = _SESSION.get(url, params=params, timeout=30)
+            r = _SESSION.get(url, params=params, timeout=60)  # ↑ timeout 30→60
             r.raise_for_status()
             data = r.json()
-            _CACHE[key] = data
+            _cache_set(key, data)
             return data
+        except requests.exceptions.HTTPError as e:
+            if r.status_code == 429:
+                # 429 Too Many Requests - tunggu lebih lama dan coba lagi
+                retry_after = r.headers.get('Retry-After')
+                if retry_after:
+                    sleep_time = int(retry_after) + 1
+                else:
+                    sleep_time = 5 * (attempt + 1)  # exponential: 5, 10, 15, ...
+                time.sleep(sleep_time)
+                last_err = e
+            else:
+                last_err = e
+                break  # error selain 429, berhenti
+        except requests.exceptions.Timeout:
+            # Timeout - coba lagi dengan delay
+            sleep_time = 2 * (attempt + 1)
+            time.sleep(sleep_time)
+            last_err = e
+        except requests.exceptions.ConnectionError:
+            # Connection error - coba lagi dengan delay
+            sleep_time = 3 * (attempt + 1)
+            time.sleep(sleep_time)
+            last_err = e
         except Exception as e:
             last_err = e
-            time.sleep(0.8 * (attempt + 1))
-    raise last_err
+            break
+    
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("Unknown error fetching GFS data")
 
 
 def fetch_wind(lat, lon, hpa, target_time):
+    """Ambil data wind untuk satu level tekanan tertentu."""
     data = _fetch_all_levels(lat, lon)
     times = data["hourly"]["time"]
     target_str = target_time.strftime("%Y-%m-%dT%H:00")
+    
     if target_str in times:
         idx = times.index(target_str)
     else:
         idx = min(range(len(times)),
                   key=lambda i: abs(datetime.fromisoformat(times[i]).replace(tzinfo=timezone.utc) - target_time))
+    
     return {
         "dir": data["hourly"][f"wind_direction_{hpa}hPa"][idx],
         "spd": data["hourly"][f"wind_speed_{hpa}hPa"][idx],
-        "temp": data["hourly"][f"temperature_{hpa}hPa"][idx],
-        "hgt": data["hourly"][f"geopotential_height_{hpa}hPa"][idx],
         "time": times[idx],
     }
 
@@ -213,11 +315,16 @@ def analyze_route(route, fl=None, target_time=None, use_profile=False):
 
         head, cross = wind_components(w["dir"], w["spd"], trk)
         rows.append({
-            "ident": name, "lat": lat, "lon": lon, "fl": fl_key,
-            "track": round(trk), "dist": round(dist),
-            "wind_dir": round(w["dir"]), "wind_spd": round(w["spd"]),
-            "headwind": round(head), "crosswind": round(cross),
-            "oat": round(w["temp"]), "isa_dev": round(w["temp"] - isa_temp(alt_ft)),
+            "ident": name,
+            "lat": lat,
+            "lon": lon,
+            "fl": fl_key,
+            "track": round(trk),
+            "dist": round(dist),
+            "wind_dir": round(w["dir"]),
+            "wind_spd": round(w["spd"]),
+            "headwind": round(head),
+            "crosswind": round(cross),
         })
         if i < n - 1:
             total_dist += dist
@@ -243,7 +350,11 @@ def compare_altitudes(route, target_time, fls=None):
     out = []
     for fl in fls:
         _, s = analyze_route(route, fl=fl, target_time=target_time, use_profile=False)
-        out.append({"fl": nearest_fl_key(fl), "avg_wc": s["avg_wc"],
-                    "label": s["avg_wc_label"], "type": s["wind_type"]})
+        out.append({
+            "fl": nearest_fl_key(fl),
+            "avg_wc": s["avg_wc"],
+            "label": s["avg_wc_label"],
+            "type": s["wind_type"]
+        })
     best = min(out, key=lambda x: x["avg_wc"]) if out else None
     return out, best

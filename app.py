@@ -133,8 +133,8 @@ with st.sidebar:
                           options=[240, 300, 340, 390], value=340)
     hours_ahead = st.slider("FORECAST +JAM", 0, 48, 1)
     st.divider()
-    run = st.button("▶ ANALISA", type="primary", use_container_width=True)
-    run_compare = st.button("▤ BANDINGKAN ALTITUDE", use_container_width=True)
+    run = st.button("▶ ANALISA", type="primary", width='stretch')
+    run_compare = st.button("▤ BANDINGKAN ALTITUDE", width='stretch')
 
 # ===== Plotly (merah-krem) =====
 def style_fig(fig, height=320):
@@ -199,10 +199,10 @@ if run and route:
                .set_table_styles([{"selector":"th","props":[("background-color",RED),
                    ("color",CREAM),("font-family","Bungee"),("font-size","11px"),
                    ("border",f"2px solid {INK}")]}]))
-        st.dataframe(sty, use_container_width=True, hide_index=True, height=430)
+        st.dataframe(sty, width='stretch', hide_index=True, height=430)
     with chcol:
-        st.plotly_chart(wind_bar(df), use_container_width=True)
-        st.plotly_chart(profile_chart(df), use_container_width=True)
+        st.plotly_chart(wind_bar(df), width='stretch')
+        st.plotly_chart(profile_chart(df), width='stretch')
 
     st.download_button("⬇ EXPORT CSV", df.to_csv(index=False).encode("utf-8"),
                        file_name=f"{route_label}_wind.csv", mime="text/csv")
@@ -229,7 +229,7 @@ if run_compare and route:
         hovertemplate="%{x}<br>%{y:+d} kt<extra></extra>")
     fig.update_layout(title=dict(text="AVG WIND COMPONENT vs ALTITUDE",
                                  font=dict(size=11, color=DIM)))
-    st.plotly_chart(style_fig(fig, 320), use_container_width=True)
+    st.plotly_chart(style_fig(fig, 320), width='stretch')
     st.markdown('<div class="pfoot">GFS · NOAA FORECAST</div>', unsafe_allow_html=True)
 
 # ===== Awal =====
