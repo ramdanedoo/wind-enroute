@@ -161,20 +161,36 @@ def analyze_route(route, fl=None, target_time=None, use_profile=False):
     """
     Analisa angin per waypoint.
       use_profile=False : semua waypoint pakai satu 'fl' (mode cruise).
-      use_profile=True  : tiap waypoint pakai FL-nya sendiri dari CSV
-                          (profil climb/cruise/descent, mirip OFP).
+      use_profile=True  : climb & descent ikut FL dari CSV, TAPI waypoint
+                          yang berada di cruise (FL tertinggi rute) diganti
+                          ke 'fl' pilihan slider. Jadi kamu bisa eksperimen
+                          "profil OFP tapi cruise di FL sekian".
     Kembalikan (rows, summary).
     """
     rows = []
     total_dist, wc_sum = 0.0, 0.0
     n = len(route)
 
+    # Tentukan cruise FL asli dari CSV = FL tertinggi di rute.
+    # Waypoint dengan FL == cruise_fl dianggap fase cruise → ikut slider.
+    csv_fls = [wp.get('fl') for wp in route if wp.get('fl')]
+    cruise_fl_csv = max(csv_fls) if csv_fls else None
+
     for i, wp in enumerate(route):
         name, lat, lon = wp['ident'], wp['lat'], wp['lon']
+        wp_fl = wp.get('fl')
 
         # tentukan FL untuk waypoint ini
         if use_profile:
-            wfl = wp.get('fl') or fl or 330   # fallback kalau kolom fl kosong
+            if wp_fl is None:
+                # CSV tanpa data FL → pakai slider (fallback)
+                wfl = fl or 330
+            elif cruise_fl_csv and wp_fl >= cruise_fl_csv - 5:
+                # waypoint fase cruise → pakai FL pilihan slider
+                wfl = fl or wp_fl
+            else:
+                # climb/descent → tetap ikut CSV
+                wfl = wp_fl
         else:
             wfl = fl
         fl_key = nearest_fl_key(wfl)
@@ -206,7 +222,9 @@ def analyze_route(route, fl=None, target_time=None, use_profile=False):
     avg_wc = wc_sum / total_dist if total_dist else 0
     summary = {
         "mode": "profile" if use_profile else "cruise",
-        "fl": (nearest_fl_key(fl) if fl and not use_profile else None),
+        "fl": nearest_fl_key(fl) if fl else None,
+        "cruise_fl": nearest_fl_key(fl) if (use_profile and fl) else (
+            nearest_fl_key(fl) if fl and not use_profile else None),
         "total_dist": round(total_dist),
         "avg_wc": round(avg_wc),
         "avg_wc_label": f"{'M' if avg_wc>=0 else 'P'}{abs(round(avg_wc)):03d}",

@@ -74,11 +74,11 @@ with st.sidebar:
                    "ofp_to_csv.py versi baru, atau pilih mode Cruise.")
 
     fl = st.select_slider(
-        "Flight Level (mode Cruise)",
+        "Cruise Level" if use_profile else "Flight Level",
         options=[240, 300, 340, 390],
         value=340,
-        help="Dipakai di mode Cruise, atau sebagai fallback profil.",
-        disabled=use_profile and has_profile,
+        help=("Mode Profil: ini mengatur CRUISE level. Climb & descent tetap "
+              "ikut CSV. Mode Cruise: seluruh rute di FL ini."),
     )
 
     hours_ahead = st.slider(
@@ -113,7 +113,7 @@ if run and route:
     c1.metric("Rute", route_label)
     c2.metric("Total Jarak", f"{summary['total_dist']} NM")
     if summary["mode"] == "profile":
-        c3.metric("Mode", "Profil OFP", "climb/cruise/descent")
+        c3.metric("Mode", "Profil OFP", f"cruise FL{summary['fl']:03d}")
     else:
         c3.metric("Cruise", f"FL{summary['fl']:03d}")
     c4.metric("Avg Wind Comp",
@@ -121,7 +121,7 @@ if run and route:
               summary["wind_type"],
               delta_color="inverse")
 
-    mode_txt = ("Profil OFP — tiap waypoint pakai altitude aslinya"
+    mode_txt = (f"Profil OFP — climb/descent ikut CSV, cruise di FL{summary['fl']:03d}"
                 if summary["mode"] == "profile"
                 else f"Cruise FL{summary['fl']:03d} — seluruh rute satu level")
     st.caption(f"Forecast: {tgt.strftime('%Y-%m-%d %H:%M UTC')} · {mode_txt} · "
