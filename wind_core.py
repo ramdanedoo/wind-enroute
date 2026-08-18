@@ -183,8 +183,12 @@ def analyze_route(route, fl=None, target_time=None, use_profile=False):
         # tentukan FL untuk waypoint ini
         if use_profile:
             if wp_fl is None:
-                # CSV tanpa data FL → pakai slider (fallback)
-                wfl = fl or 330
+                # CSV tanpa data FL. Departure (waypoint pertama) & arrival
+                # (terakhir) ada di permukaan → pakai level terendah, BUKAN cruise.
+                if i == 0 or i == n - 1:
+                    wfl = 50   # ~permukaan (level GFS terendah yang dipakai)
+                else:
+                    wfl = fl or 330   # tengah tanpa FL → fallback slider
             elif cruise_fl_csv and wp_fl >= cruise_fl_csv - 5:
                 # waypoint fase cruise → pakai FL pilihan slider
                 wfl = fl or wp_fl
