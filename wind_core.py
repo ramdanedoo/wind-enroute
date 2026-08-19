@@ -44,7 +44,9 @@ class RateLimiter:
         
         self.requests.append(time.time())
 
-_rate_limiter = RateLimiter(max_requests_per_minute=8)
+# Karena sekarang pakai batch multi-lokasi (1 request per rute, bukan 18),
+# limit bisa dilonggarkan. 20/menit aman untuk Open-Meteo gratis.
+_rate_limiter = RateLimiter(max_requests_per_minute=20)
 
 # --- Session dengan retry otomatis ---
 _SESSION = requests.Session()
@@ -165,15 +167,73 @@ def load_route_from_text(text):
 # ---------- Ambil data GFS ----------
 def _build_hourly_params():
     """
-    Bangun list variabel hourly.
-    HANYA wind speed dan direction untuk mengurangi ukuran request.
-    (Yang lama juga fetch temperature dan geopotential_height — tidak perlu untuk analisa wind utama)
+    Bangun list variabel hourly: wind speed, direction, dan temperature.
+    Temperature dikembalikan agar OAT & ISA deviation tersedia di tabel.
     """
     hourly = []
     for hpa in ALL_HPA:
         hourly.append(f"wind_speed_{hpa}hPa")
         hourly.append(f"wind_direction_{hpa}hPa")
+        hourly.append(f"temperature_{hpa}hPa")
     return hourly
+
+
+def prefetch_route(route):
+    """
+    OPTIMASI UTAMA: ambil SEMUA waypoint dalam SATU request (multi-lokasi).
+    Open-Meteo menerima koordinat dipisah koma, mengembalikan array hasil.
+    Ini mengubah 18 request → 1 request, jadi cepat & tidak kena rate limit.
+    Hasil disimpan ke cache yang sama, sehingga fetch_wind() tinggal baca cache.
+    """
+    # kumpulkan koordinat unik yang belum ada di cache
+    todo = []
+    for wp in route:
+        key = (round(wp['lat'], 3), round(wp['lon'], 3))
+        if _cache_get(key) is None and key not in [t[0] for t in todo]:
+            todo.append((key, wp['lat'], wp['lon']))
+    if not todo:
+        return
+
+    _rate_limiter.wait_if_needed()
+    url = "https://api.open-meteo.com/v1/gfs"
+    params = {
+        "latitude": ",".join(str(t[1]) for t in todo),
+        "longitude": ",".join(str(t[2]) for t in todo),
+        "hourly": _build_hourly_params(),
+        "wind_speed_unit": "kn",
+        "forecast_days": 3,
+        "timezone": "UTC",
+    }
+
+    last_err = None
+    for attempt in range(8):
+        try:
+            r = _SESSION.get(url, params=params, timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            # Multi-lokasi → Open-Meteo balas LIST of dict (satu per koordinat).
+            # Single-lokasi → balas satu dict. Normalisasi jadi list.
+            results = data if isinstance(data, list) else [data]
+            for (key, _, _), loc_data in zip(todo, results):
+                _cache_set(key, loc_data)
+            return
+        except requests.exceptions.HTTPError as e:
+            if r.status_code == 429:
+                retry_after = r.headers.get('Retry-After')
+                time.sleep(int(retry_after) + 1 if retry_after else 5 * (attempt + 1))
+                last_err = e
+            else:
+                last_err = e
+                break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            time.sleep(2 * (attempt + 1))
+            last_err = e
+        except Exception as e:
+            last_err = e
+            break
+    # kalau batch gagal, biarkan — fetch_wind akan fallback per-lokasi
+    if last_err:
+        print(f"[prefetch] batch gagal, fallback per-waypoint: {last_err}")
 
 
 def _fetch_all_levels(lat, lon):
@@ -254,6 +314,8 @@ def fetch_wind(lat, lon, hpa, target_time):
     return {
         "dir": data["hourly"][f"wind_direction_{hpa}hPa"][idx],
         "spd": data["hourly"][f"wind_speed_{hpa}hPa"][idx],
+        "temp": data["hourly"].get(f"temperature_{hpa}hPa", [None])[idx]
+                if f"temperature_{hpa}hPa" in data["hourly"] else None,
         "time": times[idx],
     }
 
@@ -272,6 +334,9 @@ def analyze_route(route, fl=None, target_time=None, use_profile=False):
     rows = []
     total_dist, wc_sum = 0.0, 0.0
     n = len(route)
+
+    # OPTIMASI: tarik semua waypoint sekaligus (1 request), bukan 18 request.
+    prefetch_route(route)
 
     # Tentukan cruise FL asli dari CSV = FL tertinggi di rute.
     # Waypoint dengan FL == cruise_fl dianggap fase cruise → ikut slider.
@@ -314,6 +379,8 @@ def analyze_route(route, fl=None, target_time=None, use_profile=False):
             dist = 0.0
 
         head, cross = wind_components(w["dir"], w["spd"], trk)
+        oat = w.get("temp")
+        isa_dev = (round(oat - isa_temp(alt_ft)) if oat is not None else None)
         rows.append({
             "ident": name,
             "lat": lat,
@@ -325,6 +392,8 @@ def analyze_route(route, fl=None, target_time=None, use_profile=False):
             "wind_spd": round(w["spd"]),
             "headwind": round(head),
             "crosswind": round(cross),
+            "oat": round(oat) if oat is not None else None,
+            "isa_dev": isa_dev,
         })
         if i < n - 1:
             total_dist += dist
