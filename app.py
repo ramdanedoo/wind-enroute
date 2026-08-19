@@ -208,16 +208,32 @@ if run and route:
     if "isa_dev" in df.columns and df["isa_dev"].notna().any():
         tbl["ISA"] = df["isa_dev"]
     df_show = pd.DataFrame(tbl)
-    def hw_c(v): return f"color:{RED};font-weight:800" if v>=0 else f"color:#6b8e23;font-weight:800"
-    fmt = {"HW":"{:+d}","XW":"{:+d}"}
-    if "ISA" in df_show.columns: fmt["ISA"] = "{:+d}"
-    sty = (df_show.style.map(hw_c, subset=["HW"])
-           .format(fmt)
-           .set_properties(**{"font-family":"JetBrains Mono, monospace",
-                              "background-color":CREAM,"color":INK,"border":f"1px solid {INK}"})
-           .set_table_styles([{"selector":"th","props":[("background-color",RED),
-               ("color",CREAM),("font-family","Bungee"),("font-size","11px"),
-               ("border",f"2px solid {INK}")]}]))
+
+    # Warna: headwind merah, tailwind hijau. XW dibedakan juga.
+    def hw_c(v):
+        return f"color:{RED};font-weight:800" if v >= 0 else "color:#3a8a3a;font-weight:800"
+    def xw_c(v):
+        return "color:#8a6d3b;font-weight:700"
+
+    fmt = {"HW": "{:+d}", "XW": "{:+d}"}
+    if "ISA" in df_show.columns:
+        fmt["ISA"] = "{:+d}"
+
+    sty = df_show.style
+    # base dulu (jangan set color global agar tidak menimpa warna HW)
+    sty = sty.set_properties(**{"font-family": "JetBrains Mono, monospace",
+                                "background-color": CREAM,
+                                "border": f"1px solid {INK}"})
+    # warna teks default untuk kolom non-HW
+    non_hw = [c for c in df_show.columns if c != "HW"]
+    sty = sty.set_properties(subset=non_hw, **{"color": INK})
+    # warna HW diterapkan TERAKHIR agar menang
+    sty = sty.map(hw_c, subset=["HW"])
+    sty = sty.format(fmt)
+    sty = sty.set_table_styles([{"selector": "th", "props": [
+        ("background-color", RED), ("color", CREAM),
+        ("font-family", "Bungee"), ("font-size", "11px"),
+        ("border", f"2px solid {INK}")]}])
     st.dataframe(sty, use_container_width=True, hide_index=True, height=400)
 
     # Charts menumpuk (full width masing-masing) — enak di HP & laptop
