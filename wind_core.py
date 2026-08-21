@@ -427,3 +427,158 @@ def compare_altitudes(route, target_time, fls=None):
         })
     best = min(out, key=lambda x: x["avg_wc"]) if out else None
     return out, best
+
+
+# =============================================================================
+# METAR / TAF — cuaca bandara (dari Aviation Weather Center, NOAA)
+# Sumber: aviationweather.gov (gratis, tanpa API key)
+# =============================================================================
+
+def is_icao_airport(ident):
+    """
+    Tebak apakah sebuah ident adalah kode ICAO bandara (4 huruf).
+    Waypoint enroute biasanya 5 huruf (TAVIP) atau ada angka (LL623).
+    Bandara ICAO: 4 huruf, huruf semua (WIII, WALL, WAAA, WAOO).
+    """
+    return (len(ident) == 4 and ident.isalpha() and ident.isupper())
+
+
+def extract_airports(route):
+    """Ambil daftar kode ICAO bandara dari rute (waypoint 4-huruf)."""
+    seen = []
+    for wp in route:
+        ident = wp['ident'] if isinstance(wp, dict) else wp[0]
+        if is_icao_airport(ident) and ident not in seen:
+            seen.append(ident)
+    return seen
+
+
+def fetch_metar_taf(icao_list):
+    """
+    Ambil METAR & TAF untuk daftar ICAO dari aviationweather.gov.
+    Return dict: {icao: {"metar": raw, "taf": raw}}.
+    Kalau data tak tersedia, value-nya None.
+    """
+    result = {}
+    if not icao_list:
+        return result
+    ids = ",".join(icao_list)
+
+    # METAR (format raw text)
+    metars = {}
+    try:
+        _rate_limiter.wait_if_needed()
+        r = _SESSION.get("https://aviationweather.gov/api/data/metar",
+                         params={"ids": ids, "format": "raw", "hours": 2},
+                         timeout=30)
+        r.raise_for_status()
+        for line in r.text.strip().split("\n"):
+            line = line.strip()
+            if len(line) >= 4:
+                code = line.split()[0]
+                # simpan yang terbaru saja per bandara
+                if code not in metars:
+                    metars[code] = line
+    except Exception as e:
+        print(f"[metar] gagal: {e}")
+
+    # TAF (format raw text)
+    tafs = {}
+    try:
+        _rate_limiter.wait_if_needed()
+        r = _SESSION.get("https://aviationweather.gov/api/data/taf",
+                         params={"ids": ids, "format": "raw"},
+                         timeout=30)
+        r.raise_for_status()
+        blocks = r.text.strip().split("\n")
+        current_code = None
+        for line in blocks:
+            line = line.strip()
+            if not line:
+                continue
+            # baris TAF baru mulai dengan "TAF" atau kode ICAO
+            first = line.split()[0] if line.split() else ""
+            if first == "TAF":
+                parts = line.split()
+                current_code = parts[1] if len(parts) > 1 else None
+                if current_code:
+                    tafs[current_code] = line
+            elif first in icao_list:
+                current_code = first
+                tafs[current_code] = line
+            elif current_code:
+                tafs[current_code] += " " + line
+    except Exception as e:
+        print(f"[taf] gagal: {e}")
+
+    for icao in icao_list:
+        result[icao] = {
+            "metar": metars.get(icao),
+            "taf": tafs.get(icao),
+        }
+    return result
+
+
+# ---- Decoder METAR sederhana (bahasa manusia) ----
+_CLOUD = {"FEW": "sedikit awan (1-2/8)", "SCT": "awan tersebar (3-4/8)",
+          "BKN": "awan banyak (5-7/8)", "OVC": "tertutup awan (8/8)",
+          "NSC": "tak ada awan signifikan", "SKC": "cerah", "CLR": "cerah",
+          "CAVOK": "cerah, jarak pandang bagus (CAVOK)"}
+_WX = {"RA": "hujan", "SHRA": "hujan lokal", "TS": "badai petir",
+       "TSRA": "badai petir + hujan", "DZ": "gerimis", "BR": "kabut tipis",
+       "HZ": "haze/asap", "FG": "kabut tebal", "FU": "asap", "VCTS": "badai di sekitar",
+       "CB": "awan cumulonimbus (badai)"}
+
+
+def decode_metar(raw):
+    """Decode METAR mentah jadi ringkasan bahasa Indonesia."""
+    if not raw:
+        return "Data METAR tidak tersedia."
+    parts = raw.split()
+    out = []
+    for p in parts:
+        # Angin: 04013KT atau 04013G25KT atau VRB08KT
+        if (p.endswith("KT") and (p[:3].isdigit() or p.startswith("VRB"))):
+            if p.startswith("VRB"):
+                spd = p[3:5]
+                out.append(f"Angin variabel {spd}kt")
+            else:
+                d = p[:3]; spd = p[3:5]
+                gust = ""
+                if "G" in p:
+                    gust = f" (gust {p[p.index('G')+1:p.index('G')+3]}kt)"
+                out.append(f"Angin {d}° {spd}kt{gust}")
+        # Visibility: 8000, 9999, atau CAVOK
+        elif p == "CAVOK":
+            out.append("CAVOK (cerah, visibility ≥10km)")
+        elif p.isdigit() and len(p) == 4:
+            vis = int(p)
+            vis_txt = "≥10km" if vis >= 9999 else f"{vis}m"
+            out.append(f"Visibility {vis_txt}")
+        # Awan: FEW020, SCT025, BKN008, dst
+        elif p[:3] in _CLOUD and len(p) >= 6 and p[3:6].isdigit():
+            alt = int(p[3:6]) * 100
+            cb = " (CB)" if p.endswith("CB") else ""
+            out.append(f"{_CLOUD[p[:3]]} di {alt}ft{cb}")
+        elif p in _CLOUD:
+            out.append(_CLOUD[p])
+        # Cuaca signifikan
+        elif p in _WX:
+            out.append(_WX[p])
+        elif p.lstrip("+-") in _WX:
+            pre = "hujan lebat " if p.startswith("+") else "ringan " if p.startswith("-") else ""
+            out.append(pre + _WX[p.lstrip("+-")])
+        # Suhu/dewpoint: 32/25 atau 30/M02
+        elif "/" in p and len(p) <= 7 and (p[0].isdigit() or p[0] == "M"):
+            t, d = p.split("/")
+            t = t.replace("M", "-"); d = d.replace("M", "-")
+            if t.lstrip("-").isdigit():
+                out.append(f"Suhu {t}°C / dewpoint {d}°C")
+        # QNH: Q1008 atau A2992
+        elif p.startswith("Q") and p[1:].isdigit():
+            out.append(f"QNH {p[1:]} hPa")
+        elif p.startswith("A") and p[1:].isdigit():
+            out.append(f"Altimeter {p[1:3]}.{p[3:]} inHg")
+        elif p == "NOSIG":
+            out.append("Tidak ada perubahan signifikan (NOSIG)")
+    return " · ".join(out) if out else "Tidak bisa decode."
