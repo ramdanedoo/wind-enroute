@@ -474,11 +474,24 @@ def fetch_metar_taf(icao_list):
         r.raise_for_status()
         for line in r.text.strip().split("\n"):
             line = line.strip()
-            if len(line) >= 4:
-                code = line.split()[0]
-                # simpan yang terbaru saja per bandara
-                if code not in metars:
-                    metars[code] = line
+            if not line:
+                continue
+            tokens = line.split()
+            # METAR bisa diawali "METAR"/"SPECI" lalu kode ICAO, atau langsung kode.
+            # Cari kode ICAO yang cocok dari daftar di 2 token pertama.
+            code = None
+            for tok in tokens[:2]:
+                if tok in icao_list:
+                    code = tok
+                    break
+            if code is None:
+                # fallback: token pertama yang bukan METAR/SPECI
+                for tok in tokens[:2]:
+                    if tok not in ("METAR", "SPECI"):
+                        code = tok
+                        break
+            if code and code not in metars:
+                metars[code] = line
     except Exception as e:
         print(f"[metar] gagal: {e}")
 
