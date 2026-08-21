@@ -10,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
+import pydeck as pdk
 import streamlit as st
 
 import wind_core as wc
@@ -97,7 +98,9 @@ def list_routes():
     files = sorted(glob.glob(os.path.join(ROUTES_DIR, "*.csv")))
     return {os.path.splitext(os.path.basename(f))[0]: f for f in files}
 
-def target_time(h):
+def target_time(h, custom=None):
+    if custom is not None:
+        return custom.replace(minute=0, second=0, microsecond=0)
     t = datetime.now(timezone.utc) + timedelta(hours=h)
     return t.replace(minute=0, second=0, microsecond=0)
 
@@ -137,11 +140,25 @@ with st.expander("⚙️ FLIGHT SETUP — ketuk untuk atur rute & mode", expande
         use_profile = mode.startswith("Profil")
         fl = st.select_slider("CRUISE LEVEL" if use_profile else "FLIGHT LEVEL",
                               options=[240, 300, 340, 390], value=340)
-        hours_ahead = st.slider("FORECAST +JAM", 0, 48, 1)
+        wx_time_mode = st.radio("WAKTU FORECAST",
+                                ["Cepat (+jam dari sekarang)", "Tanggal & jam spesifik"],
+                                horizontal=False)
+        if wx_time_mode.startswith("Cepat"):
+            hours_ahead = st.slider("FORECAST +JAM", 0, 120, 1)
+            custom_dt = None
+        else:
+            from datetime import date, time as dtime
+            cd1, cd2 = st.columns([1, 1])
+            pick_date = cd1.date_input("Tanggal (UTC)")
+            pick_hour = cd2.selectbox("Jam UTC", list(range(24)), index=8)
+            custom_dt = datetime.combine(pick_date, dtime(hour=pick_hour),
+                                         tzinfo=timezone.utc)
+            hours_ahead = 0
 
     b1, b2 = st.columns([1, 1])
     run = b1.button("▶ ANALISA", type="primary", use_container_width=True)
     run_compare = b2.button("▤ BANDINGKAN ALTITUDE", use_container_width=True)
+    run_wx = st.button("☁ CEK CUACA BANDARA", use_container_width=True)
 
 # ===== Plotly =====
 def style_fig(fig, height=300):
@@ -174,9 +191,74 @@ def profile_chart(df):
                       yaxis=dict(title="ALT ft"))
     return style_fig(fig, 260)
 
+def wind_altitude_chart(results):
+    """Grafik angin per FL: sumbu Y = altitude, X = avg wind component.
+    Bantu lihat FL mana yang paling menguntungkan secara visual (vertikal)."""
+    fls = [r["fl"]*100 for r in results]
+    wcs = [r["avg_wc"] for r in results]
+    colors = [RED if w >= 0 else "#3a8a3a" for w in wcs]
+    fig = go.Figure()
+    fig.add_scatter(x=wcs, y=fls, mode="lines+markers",
+                    line=dict(color=INK, width=2, dash="dot"),
+                    marker=dict(size=12, color=colors, line=dict(color=INK, width=1.5)),
+                    hovertemplate="FL%{customdata:03d}<br>%{x:+d} kt<extra></extra>",
+                    customdata=[r["fl"] for r in results])
+    fig.add_vline(x=0, line=dict(color=DIM, width=1))
+    fig.update_layout(
+        title=dict(text="PROFIL ANGIN VERTIKAL · geser kiri (tailwind) = lebih hemat",
+                   font=dict(size=11, color=DIM)),
+        xaxis=dict(title="WIND COMPONENT (kt) · + headwind / − tailwind"),
+        yaxis=dict(title="ALTITUDE (ft)"))
+    return style_fig(fig, 340)
+
+
+def route_map(rows):
+    """Peta rute: garis penghubung waypoint + panah arah angin tiap titik.
+    Panah pakai karakter '↑' yang diputar sesuai arah DATANG angin."""
+    pts = [{"lat": r["lat"], "lon": r["lon"], "name": r["ident"]} for r in rows]
+    path = [[p["lon"], p["lat"]] for p in pts]
+
+    # panah angin: arah "from" → tanda panah menunjuk ke arah angin bertiup (from+180)
+    arrows = []
+    for r in rows:
+        wf = r.get("wind_dir", 0)
+        spd = r.get("wind_spd", 0)
+        arrows.append({
+            "lat": r["lat"], "lon": r["lon"],
+            "text": "➤",
+            "angle": -(wf + 180) % 360,   # deck rotasi; panah ke arah tiupan
+            "info": f"{r['ident']} · {wf:03d}/{spd}kt · HW {r.get('headwind',0):+d}",
+        })
+
+    layers = [
+        # garis rute
+        pdk.Layer("PathLayer", data=[{"path": path}],
+                  get_path="path", get_color=[26, 26, 26], width_min_pixels=2),
+        # titik waypoint
+        pdk.Layer("ScatterplotLayer", data=pts,
+                  get_position=["lon", "lat"], get_radius=3000,
+                  get_fill_color=[232, 69, 47], pickable=True),
+        # label waypoint
+        pdk.Layer("TextLayer", data=pts,
+                  get_position=["lon", "lat"], get_text="name",
+                  get_size=11, get_color=[26, 26, 26],
+                  get_pixel_offset=[0, -14]),
+        # panah angin
+        pdk.Layer("TextLayer", data=arrows,
+                  get_position=["lon", "lat"], get_text="text",
+                  get_size=22, get_color=[0, 120, 200],
+                  get_angle="angle", pickable=True),
+    ]
+    lats = [p["lat"] for p in pts]; lons = [p["lon"] for p in pts]
+    view = pdk.ViewState(latitude=sum(lats)/len(lats),
+                         longitude=sum(lons)/len(lons), zoom=5.2)
+    return pdk.Deck(layers=layers, initial_view_state=view,
+                    map_style="light",
+                    tooltip={"text": "{info}{name}"})
+
 # ===== Analisa =====
 if run and route:
-    tgt = target_time(hours_ahead)
+    tgt = target_time(hours_ahead, custom_dt)
     with st.spinner("🦖 Menarik data GFS…"):
         rows, summary = wc.analyze_route(route, fl=fl, target_time=tgt,
                                          use_profile=use_profile)
@@ -240,6 +322,15 @@ if run and route:
     st.plotly_chart(wind_bar(df), use_container_width=True)
     st.plotly_chart(profile_chart(df), use_container_width=True)
 
+    # Peta rute + panah angin
+    st.markdown(f'<div style="color:{RED};font-family:Bungee;font-size:.85rem;'
+                f'margin:8px 0 4px">🗺 PETA RUTE & ANGIN</div>', unsafe_allow_html=True)
+    st.caption("Garis = rute · titik merah = waypoint · panah biru = arah angin bertiup")
+    try:
+        st.pydeck_chart(route_map(rows), use_container_width=True)
+    except Exception as e:
+        st.info(f"Peta tidak bisa dimuat: {e}")
+
     st.download_button("⬇ EXPORT CSV", df.to_csv(index=False).encode("utf-8"),
                        file_name=f"{route_label}_wind.csv", mime="text/csv",
                        use_container_width=True)
@@ -248,7 +339,7 @@ if run and route:
 
 # ===== Bandingkan =====
 elif run_compare and route:
-    tgt = target_time(hours_ahead)
+    tgt = target_time(hours_ahead, custom_dt)
     with st.spinner("🦖 Membandingkan altitude…"):
         results, best = wc.compare_altitudes(route, tgt)
     st.markdown('<div class="side-title">▤ ALTITUDE COMPARISON</div>', unsafe_allow_html=True)
@@ -269,7 +360,51 @@ elif run_compare and route:
     fig.update_layout(title=dict(text="AVG WIND COMPONENT vs ALTITUDE",
                                  font=dict(size=11, color=DIM)))
     st.plotly_chart(style_fig(fig, 320), use_container_width=True)
+    # Grafik profil angin vertikal (altitude di sumbu Y)
+    st.plotly_chart(wind_altitude_chart(results), use_container_width=True)
     st.markdown('<div class="pfoot">GFS · NOAA FORECAST</div>', unsafe_allow_html=True)
+
+# ===== Cek Cuaca Bandara (METAR/TAF) =====
+elif run_wx and route:
+    airports = wc.extract_airports(route)
+    if not airports:
+        st.warning("Tidak ada kode ICAO bandara terdeteksi di rute ini.")
+    else:
+        with st.spinner(f"☁ Mengambil METAR/TAF untuk {', '.join(airports)}…"):
+            wx = wc.fetch_metar_taf(airports)
+        st.markdown('<div class="side-title">☁ CUACA BANDARA</div>',
+                    unsafe_allow_html=True)
+        st.markdown(f'<div style="color:{DIM};font-family:JetBrains Mono;'
+                    f'font-size:.66rem;margin-bottom:12px">Sumber: aviationweather.gov '
+                    f'(NOAA) · METAR=observasi aktual · TAF=prakiraan terminal</div>',
+                    unsafe_allow_html=True)
+        for icao in airports:
+            data = wx.get(icao, {})
+            metar_raw = data.get("metar")
+            taf_raw = data.get("taf")
+            st.markdown(f'<div class="pcard"><div class="lbl">AIRPORT</div>'
+                        f'<div class="val">{icao}</div></div>',
+                        unsafe_allow_html=True)
+            if metar_raw:
+                st.markdown(f'<div style="color:{RED};font-family:Bungee;'
+                            f'font-size:.8rem;margin:4px 0">METAR</div>',
+                            unsafe_allow_html=True)
+                st.markdown(f'<div style="color:{INK};font-family:JetBrains Mono;'
+                            f'font-size:.8rem;line-height:1.5">🔎 {wc.decode_metar(metar_raw)}</div>',
+                            unsafe_allow_html=True)
+                st.code(metar_raw, language=None)
+            else:
+                st.info(f"METAR {icao} tidak tersedia.")
+            if taf_raw:
+                st.markdown(f'<div style="color:{RED};font-family:Bungee;'
+                            f'font-size:.8rem;margin:4px 0">TAF (prakiraan)</div>',
+                            unsafe_allow_html=True)
+                st.code(taf_raw, language=None)
+            else:
+                st.caption(f"TAF {icao} tidak tersedia.")
+            st.write("")
+        st.markdown('<div class="pfoot">METAR/TAF · AVIATIONWEATHER.GOV</div>',
+                    unsafe_allow_html=True)
 
 # ===== Awal =====
 else:
